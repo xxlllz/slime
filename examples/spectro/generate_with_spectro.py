@@ -12,7 +12,7 @@ from spectro_tool_sandbox import SEMAPHORE, TOOL_CONFIGS, tool_registry
 # Qwen3 tool-calling template (same as retool)
 TOOL_TEMPLATE = """<|im_start|>system
 {%- if messages[0]['role'] == 'system' %}
-{{- messages[0]['content'] }}
+{{ messages[0]['content'] }}
 {%- else %}
 You are a helpful assistant.
 {%- endif %}
@@ -23,9 +23,9 @@ You may call one or more functions to assist with the user query.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>
-{%- for tool in tools %}
-{{- tool | tojson }}
-{%- endfor %}
+{% for tool in tools %}
+{{ tool | tojson }}
+{% endfor %}
 </tools>
 
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
@@ -37,29 +37,22 @@ For each function call, return a json object with function name and arguments wi
 {%- for message in messages %}
 {%- if message['role'] == 'user' %}
 <|im_start|>user
-{{- message['content'] }}<|im_end|>
+{{ message['content'] }}<|im_end|>
 {%- elif message['role'] == 'assistant' %}
 <|im_start|>assistant
-{{- message['content'] }}<|im_end|>
+{{ message['content'] }}<|im_end|>
 {%- endif %}
 {%- endfor %}
 <|im_start|>assistant
 """
-
-SYSTEM_PROMPT = (
-    "You are a spectroscopy analysis agent specialized in molecular structure "
-    "elucidation from spectral data. Use the read_skill tool to learn analysis "
-    "techniques, then use run_code to analyze the spectrum data. Finally, provide "
-    "your predicted molecular structure as SMILES wrapped in <SMILES></SMILES> tags."
-)
-
 
 def format_conversation_with_tools(
     prompt: str, tools: list[dict[str, Any]] = None, system_prompt: str = None, messages: list[dict[str, Any]] = None
 ) -> str:
     template = Template(TOOL_TEMPLATE)
     messages_to_render = []
-    messages_to_render.append({"role": "system", "content": system_prompt or SYSTEM_PROMPT})
+    if system_prompt:
+        messages_to_render.append({"role": "system", "content": system_prompt})
     if prompt:
         messages_to_render.append({"role": "user", "content": prompt})
     if messages:
@@ -103,28 +96,39 @@ def postprocess_responses(resp: str) -> str:
     return resp
 
 
+def format_tool_observation(content: str) -> str:
+    return (
+        "<|im_end|>\n"
+        "<|im_start|>user\n"
+        "<tool_response>\n"
+        f"{content}\n"
+        "</tool_response><|im_end|>\n"
+        "<|im_start|>assistant\n"
+    )
+
+
 async def execute_predictions(prediction: str) -> tuple[str, bool]:
     action, content = postprocess_predictions(prediction)
 
     if action == "read_skill":
         result = await tool_registry.execute_tool("read_skill", {"name": content.strip()})
-        return f"\n\n<tool_response>\n{result}\n</tool_response>\n\n", False
+        return format_tool_observation(result), False
 
     elif action == "run_code":
         code = content.strip()
         if code:
             async with SEMAPHORE:
                 result = await tool_registry.execute_tool("run_code", {"code": code})
-            return f"\n\n<tool_response>\n{result}\n</tool_response>\n\n", False
+            return format_tool_observation(result), False
         else:
-            return "\n\n<tool_response>\nError: No code provided\n</tool_response>\n\n", False
+            return format_tool_observation("Error: No code provided"), False
 
     elif action == "answer":
         return "", True
 
     else:
-        return (
-            "\nYour previous action was invalid. "
+        return format_tool_observation(
+            "Error: Your previous action was invalid. "
             "Use read_skill to load domain knowledge, "
             "run_code to execute Python analysis code, "
             "or provide your final answer in <SMILES>...</SMILES> tags.\n"
@@ -276,13 +280,7 @@ async def reward_func(args, sample, **kwargs):
                     gt_fp = AllChem.GetMorganFingerprintAsBitVect(gt_mol, 2, nBits=2048)
                     tanimoto = TanimotoSimilarity(pred_fp, gt_fp)
                     result["tanimoto"] = tanimoto
-
-                    if tanimoto >= 0.85:
-                        result["score"] = 0.5
-                    elif tanimoto >= 0.6:
-                        result["score"] = 0.2
-                    else:
-                        result["score"] = -0.5
+                    result["score"] = tanimoto
         except Exception:
             result["score"] = -1.0
 
