@@ -1,4 +1,5 @@
 import json
+import os
 import re
 from typing import Any
 
@@ -119,6 +120,11 @@ _TOOL_ERRORS = (
     "Error: Your previous action was invalid",
 )
 
+_PRECOMPUTED_ADVANTAGE_KEY = "precomputed_advantages"
+_SPECTRO_STEP_SPANS_KEY = "spectro_step_token_spans"
+_SPECTRO_STEP_ACTIONS_KEY = "spectro_step_actions"
+_SPECTRO_STEP_REWARDS_KEY = "spectro_step_rewards"
+
 
 def has_tool_error(text: str) -> bool:
     return any(err in text for err in _TOOL_ERRORS)
@@ -170,6 +176,9 @@ async def generate(args, sample, sampling_params):
     response_token_ids = []
     loss_masks = []
     tool_call_count = 0
+    step_spans = []
+    step_actions = []
+    finish_reason_type = "stop"
 
     for turn in range(TOOL_CONFIGS["max_turns"]):
         total_length = len(prompt_tokens_ids) + len(response_token_ids)
@@ -179,6 +188,7 @@ async def generate(args, sample, sampling_params):
             max_context_length = args.context_parallel_size * args.max_tokens_per_gpu
         if total_length >= max_context_length:
             sample.status = Sample.Status.TRUNCATED
+            finish_reason_type = "length"
             break
 
         current_token_ids = prompt_tokens_ids + response_token_ids
@@ -189,8 +199,9 @@ async def generate(args, sample, sampling_params):
         }
 
         output = await post(url, payload)
+        finish_reason_type = output["meta_info"]["finish_reason"]["type"]
 
-        if output["meta_info"]["finish_reason"]["type"] == "abort":
+        if finish_reason_type == "abort":
             sample.status = Sample.Status.ABORTED
             return sample
 
@@ -210,26 +221,30 @@ async def generate(args, sample, sampling_params):
         cur_start = len(response_token_ids)
         response += cur_response
         response_token_ids += cur_response_token_ids
-        # Turn-level credit assignment:
-        #   - final answer turns are trained against the final SMILES reward;
-        #   - correct tool-call turns are not trained by downstream answer errors;
-        #   - invalid/tool-error turns are trained so the policy can repair them.
-        loss_masks += [0] * len(cur_response_token_ids)
+        cur_end = len(response_token_ids)
+        loss_masks += [1] * len(cur_response_token_ids)
 
-        if output["meta_info"]["finish_reason"]["type"] == "length":
-            for i in range(cur_start, len(response_token_ids)):
-                loss_masks[i] = 1
+        if finish_reason_type == "length":
+            if cur_end > cur_start:
+                step_spans.append((cur_start, cur_end))
+                step_actions.append("length")
             break
 
         next_obs, done = await execute_predictions(cur_response)
-        if done:
-            for i in range(cur_start, len(response_token_ids)):
-                loss_masks[i] = 1
-            break
+        if cur_end > cur_start:
+            if done:
+                step_action = "answer"
+            elif action not in {"read_skill", "run_code"}:
+                step_action = "invalid"
+            elif has_tool_error(next_obs):
+                step_action = "tool_error"
+            else:
+                step_action = action
+            step_spans.append((cur_start, cur_end))
+            step_actions.append(step_action)
 
-        if action not in {"read_skill", "run_code"} or has_tool_error(next_obs):
-            for i in range(cur_start, len(response_token_ids)):
-                loss_masks[i] = 1
+        if done:
+            break
 
         if "<tool_response>" in next_obs:
             tool_call_count += 1
@@ -248,8 +263,8 @@ async def generate(args, sample, sampling_params):
             )
 
         if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
-            for i in range(cur_start, len(response_token_ids) - len(obs_tokens_ids)):
-                loss_masks[i] = 1
+            if step_actions:
+                step_actions[-1] = "max_tool_calls"
             break
 
     sample.tokens = prompt_tokens_ids + response_token_ids
@@ -257,8 +272,12 @@ async def generate(args, sample, sampling_params):
     sample.response = response
     sample.loss_mask = loss_masks
     sample.tool_call_count = tool_call_count
+    sample.train_metadata = {
+        _SPECTRO_STEP_SPANS_KEY: step_spans,
+        _SPECTRO_STEP_ACTIONS_KEY: step_actions,
+    }
 
-    match output["meta_info"]["finish_reason"]["type"]:
+    match finish_reason_type:
         case "length":
             sample.status = Sample.Status.TRUNCATED
         case "abort":
@@ -267,6 +286,179 @@ async def generate(args, sample, sampling_params):
             sample.status = Sample.Status.COMPLETED
 
     return sample
+
+
+def _attach_step_rewards(sample, final_score: float) -> None:
+    metadata = dict(sample.train_metadata or {})
+    step_spans = metadata.get(_SPECTRO_STEP_SPANS_KEY) or []
+    step_actions = metadata.get(_SPECTRO_STEP_ACTIONS_KEY) or []
+    step_rewards = [0.0] * len(step_spans)
+
+    if step_rewards:
+        answer_indices = [i for i, action in enumerate(step_actions) if action == "answer"]
+        reward_index = answer_indices[-1] if answer_indices else len(step_rewards) - 1
+        step_rewards[reward_index] = float(final_score)
+
+    metadata[_SPECTRO_STEP_REWARDS_KEY] = step_rewards
+    metadata["spectro_final_score"] = float(final_score)
+    sample.train_metadata = metadata
+
+
+def _reward_to_go(step_rewards: list[float], gamma: float) -> list[float]:
+    returns = [0.0] * len(step_rewards)
+    running = 0.0
+    for i in range(len(step_rewards) - 1, -1, -1):
+        running = float(step_rewards[i]) + gamma * running
+        returns[i] = running
+    return returns
+
+
+def _post_process_scalar_rewards(args, samples):
+    import torch
+
+    raw_rewards = [sample.get_reward_value(args) for sample in samples]
+    if (
+        args.advantage_estimator in ["grpo", "gspo", "reinforce_plus_plus_baseline"]
+        and args.rewards_normalization
+    ):
+        rewards = torch.tensor(raw_rewards, dtype=torch.float)
+        if rewards.shape[-1] == args.n_samples_per_prompt * args.rollout_batch_size:
+            rewards = rewards.reshape(-1, args.n_samples_per_prompt)
+        else:
+            rewards = rewards.view(-1, rewards.shape[-1])
+        rewards = rewards - rewards.mean(dim=-1, keepdim=True)
+        if args.advantage_estimator in ["grpo", "gspo"] and args.grpo_std_normalization:
+            rewards = rewards / (rewards.std(dim=-1, keepdim=True) + 1e-6)
+        return raw_rewards, rewards.flatten().tolist()
+
+    return raw_rewards, raw_rewards
+
+
+def _compute_step_token_advantages(args, samples) -> list[list[float]]:
+    import torch
+
+    gamma = float(os.environ.get("SPECTRO_STEP_GAMMA", args.gamma))
+    group_size = args.n_samples_per_prompt
+    all_token_advantages = [[0.0] * sample.response_length for sample in samples]
+
+    for group_start in range(0, len(samples), group_size):
+        group_indices = list(range(group_start, min(group_start + group_size, len(samples))))
+        group_returns = []
+
+        for sample_idx in group_indices:
+            metadata = samples[sample_idx].train_metadata or {}
+            step_rewards = [float(x) for x in metadata.get(_SPECTRO_STEP_REWARDS_KEY, [])]
+            group_returns.append(_reward_to_go(step_rewards, gamma))
+
+        max_steps = max((len(returns) for returns in group_returns), default=0)
+        group_step_advantages = [[0.0] * len(returns) for returns in group_returns]
+
+        for step_idx in range(max_steps):
+            present = [i for i, returns in enumerate(group_returns) if step_idx < len(returns)]
+            if not present:
+                continue
+
+            values = torch.tensor([group_returns[i][step_idx] for i in present], dtype=torch.float32)
+            if args.rewards_normalization:
+                values = values - values.mean()
+                if args.grpo_std_normalization and values.numel() > 1:
+                    std = values.std()
+                    if torch.isfinite(std) and std > 1e-6:
+                        values = values / (std + 1e-6)
+                    else:
+                        values = torch.zeros_like(values)
+
+            for local_i, value in zip(present, values.tolist(), strict=False):
+                group_step_advantages[local_i][step_idx] = float(value)
+
+        for local_i, sample_idx in enumerate(group_indices):
+            sample = samples[sample_idx]
+            metadata = sample.train_metadata or {}
+            spans = metadata.get(_SPECTRO_STEP_SPANS_KEY, [])
+            token_advantages = all_token_advantages[sample_idx]
+            for span, advantage in zip(spans, group_step_advantages[local_i], strict=False):
+                start, end = int(span[0]), int(span[1])
+                start = max(0, min(start, sample.response_length))
+                end = max(start, min(end, sample.response_length))
+                for token_idx in range(start, end):
+                    token_advantages[token_idx] = advantage
+
+    return all_token_advantages
+
+
+def convert_samples_to_train_data(args, samples):
+    raw_rewards, rewards = _post_process_scalar_rewards(args, samples)
+    token_advantages = _compute_step_token_advantages(args, samples)
+
+    train_data = {
+        "tokens": [sample.tokens for sample in samples],
+        "response_lengths": [sample.response_length for sample in samples],
+        "rewards": rewards,
+        "raw_reward": raw_rewards,
+        "truncated": [1 if getattr(sample.status, "value", sample.status) == "truncated" else 0 for sample in samples],
+        "sample_indices": [sample.index for sample in samples],
+        _PRECOMPUTED_ADVANTAGE_KEY: token_advantages,
+    }
+
+    loss_masks = []
+    for sample in samples:
+        if sample.loss_mask is None:
+            sample.loss_mask = [1] * sample.response_length
+        assert len(sample.loss_mask) == sample.response_length, (
+            f"loss mask length {len(sample.loss_mask)} != response length {sample.response_length}"
+        )
+        if sample.remove_sample:
+            sample.loss_mask = [0] * sample.response_length
+        loss_masks.append(sample.loss_mask)
+    train_data["loss_masks"] = loss_masks
+
+    if samples and samples[0].rollout_log_probs is not None:
+        train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
+
+    if samples and samples[0].rollout_routed_experts is not None:
+        train_data["rollout_routed_experts"] = [sample.rollout_routed_experts for sample in samples]
+
+    if any(sample.multimodal_train_inputs is not None for sample in samples):
+        train_data["multimodal_train_inputs"] = [sample.multimodal_train_inputs for sample in samples]
+
+    if samples and samples[0].teacher_log_probs is not None:
+        train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
+
+    return train_data
+
+
+def apply_precomputed_step_advantages(args, rollout_data):
+    import torch
+    from slime.backends.megatron_utils.cp_utils import slice_log_prob_with_cp
+
+    kl = rollout_data["kl"]
+    full_advantages = rollout_data[_PRECOMPUTED_ADVANTAGE_KEY]
+    response_lengths = rollout_data["response_lengths"]
+    total_lengths = rollout_data["total_lengths"]
+    max_seq_lens = rollout_data.get("max_seq_lens", None)
+
+    advantages = []
+    for i, (advantage, response_length, total_length) in enumerate(
+        zip(full_advantages, response_lengths, total_lengths, strict=True)
+    ):
+        if len(advantage) < response_length:
+            advantage = list(advantage) + [0.0] * (response_length - len(advantage))
+        elif len(advantage) > response_length:
+            advantage = list(advantage[:response_length])
+
+        tensor = torch.tensor(advantage, dtype=torch.float32, device=kl[i].device)
+        tensor = slice_log_prob_with_cp(
+            tensor,
+            total_length,
+            response_length,
+            args.qkv_format,
+            max_seq_lens[i] if max_seq_lens is not None else None,
+        )
+        assert tensor.shape == kl[i].shape, f"advantage shape {tensor.shape} != kl shape {kl[i].shape}"
+        advantages.append(tensor)
+
+    rollout_data["advantages"] = advantages
+    rollout_data["returns"] = [adv.clone() for adv in advantages]
 
 
 def _get_expected_turns(prompt: str) -> int:
@@ -302,6 +494,7 @@ async def reward_func(args, sample, **kwargs):
         else:
             gt = str(label)
         smiles_match = re.search(r"<SMILES>(.*?)</SMILES>", response, re.DOTALL)
+        _attach_step_rewards(sample, -1.0)
         return {"score": -1.0, "pred": (smiles_match.group(1).strip() if smiles_match else ""), "gt": gt}
 
     # Extract ground truth
@@ -347,6 +540,8 @@ async def reward_func(args, sample, **kwargs):
     if result["score"] < 0:
         tool_call_reward = (num_turns - 1) / 2 * 0.1
         result["score"] = min(-0.6, result["score"] + tool_call_reward)
+
+    _attach_step_rewards(sample, float(result["score"]))
 
     # Log for debugging
     with open("/tmp/spectro_reward_debug.log", "a") as f:

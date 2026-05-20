@@ -143,6 +143,8 @@ MISC_ARGS=(
 CUSTOM_ARGS=(
    --custom-generate-function-path generate_with_spectro.generate
    --custom-rm-path generate_with_spectro.reward_func
+   --custom-convert-samples-to-train-data-path generate_with_spectro.convert_samples_to_train_data
+   --custom-advantage-function-path generate_with_spectro.apply_precomputed_step_advantages
 )
 
 # launch ray
