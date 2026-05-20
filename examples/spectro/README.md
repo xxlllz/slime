@@ -25,13 +25,16 @@ The RL reward compares predicted SMILES against ground truth using RDKit canonic
 
 ## Architecture
 
-Built on slime's pluggable rollout system, following the same pattern as `examples/retool/`:
+Built on slime's pluggable rollout system, following the same pattern as `examples/retool/`, with an additional
+step-level GRPO credit assignment path for multi-turn tool trajectories:
 
 | File | Purpose |
 |------|---------|
 | `spectro_tool_sandbox.py` | Tool registry: `read_skill` (load domain knowledge) + `run_code` (Python sandbox) |
-| `generate_with_spectro.py` | Custom async generate function (multi-turn tool loop) + reward function (SMILES comparison) |
-| `spectro_qwen3_4b_rl.sh` | Training launch script for 4-GPU setup |
+| `generate_with_spectro.py` | Custom async generate function (multi-turn tool loop), reward function (SMILES comparison), step-level advantage preprocessing |
+| `spectro_qwen3_4b_rl.sh` | Training launch script for 8-GPU setup |
+| `slime/ray/rollout.py` | Passes `precomputed_advantages` through data-parallel rollout partitioning |
+| `slime/backends/megatron_utils/data.py` | Skips non-scalar `precomputed_advantages` during rollout metric logging |
 
 ### Tools
 
@@ -58,12 +61,70 @@ Skill files are loaded from `SPECTRO_SKILLS_DIR`. Each file must be named `skill
 | Condition | Score |
 |-----------|-------|
 | Exact canonical SMILES match | 1.0 |
-| Tanimoto similarity >= 0.85 | 0.5 |
-| Tanimoto similarity >= 0.6 | 0.2 |
-| Valid but wrong SMILES | -0.5 |
-| Invalid or missing SMILES | -1.0 |
+| Valid but non-exact SMILES | Morgan fingerprint Tanimoto similarity to ground truth |
+| Missing SMILES | 0.0 |
+| Tool error response | -1.0 |
+| Reward-function exception while parsing/scoring | -1.0 |
 
-Tool usage bonus: incorrect answers with 2+ tool calls get reduced penalty (encourages tool use).
+For negative scores, a small tool-usage bonus can reduce the penalty, capped so the final score stays no higher than
+`-0.6`.
+
+### Step-Level GRPO Credit Assignment
+
+This example uses a custom step-level GRPO variant for agentic trajectories. The goal is to train assistant actions
+inside the tool loop, not only the final answer turn.
+
+The generator records one trainable step for each assistant-generated turn:
+
+```text
+assistant step 1: read_skill / run_code / invalid action / final answer
+tool observation: loss_mask = 0
+assistant step 2: read_skill / run_code / invalid action / final answer
+tool observation: loss_mask = 0
+assistant step 3: final answer
+```
+
+Only assistant tokens receive policy-gradient loss. Tool observation tokens remain in the model context but have
+`loss_mask = 0`.
+
+For the current SMILES reward, the scalar score is attached to the final answer step when present. If there is no
+answer step, it is attached to the last assistant step. Step returns are then computed as reward-to-go:
+
+```text
+G_t = r_t + gamma * G_{t+1}
+```
+
+By default `gamma` is `args.gamma` from the training config. It can be overridden without changing the script:
+
+```bash
+export SPECTRO_STEP_GAMMA=1.0
+```
+
+Advantage normalization is done per prompt group and per step index:
+
+```text
+A_{sample, step} = normalize_over_rollouts(G_{sample, step})
+```
+
+For example, all first tool-call steps from the same prompt group are compared with each other, all second steps are
+compared with each other, and so on. The resulting step advantage is copied to every assistant token in that step span.
+
+Important behavior:
+
+- This is a step-index approximation. Histories before step `t` can differ across rollouts, but they are still compared
+  within the same prompt group and step index.
+- If all rollouts have the same return for a step, the normalized advantage for that step becomes zero.
+- Do not enable `--normalize-advantages` unless you explicitly want another global masked whitening pass after the
+  step-level GRPO normalization. The current implementation already normalizes at the step level.
+- `rewards` and `raw_reward` are still emitted for logging and pass-rate metrics; the actual policy-gradient signal is
+  supplied through `precomputed_advantages`.
+
+The launch script enables this path with:
+
+```bash
+--custom-convert-samples-to-train-data-path generate_with_spectro.convert_samples_to_train_data
+--custom-advantage-function-path generate_with_spectro.apply_precomputed_step_advantages
+```
 
 ## Data
 
@@ -116,19 +177,20 @@ The script resolves `train.py` from the repository root, so it can also be launc
 
 ### Hardware Requirements
 
-- 4x GPU (A100/H100 recommended)
-- TP=2 for training, 2 GPUs for sglang rollout engine
+- 8x GPU (A100/H100 recommended)
+- 6 GPUs for actor training, 2 GPUs for the sglang rollout engine
+- TP=2, CP=1 in the default script
 - ~16K max context length per sample
 
 ### Key Training Parameters
 
 | Parameter | Value | Rationale |
 |-----------|-------|-----------|
-| `rollout-batch-size` | 16 | Longer responses than math (skill content) |
+| `rollout-batch-size` | 24 | Longer responses than math (skill content) |
 | `n-samples-per-prompt` | 8 | GRPO needs multiple samples per prompt |
 | `rollout-max-response-len` | 12288 | Skill reads (~1-8K tokens) + code + reasoning |
 | `rollout-max-context-len` | 16384 | Prompt (~4K) + response (12K) |
-| `global-batch-size` | 128 | Adjusted for longer sequences |
+| `global-batch-size` | 192 | `rollout-batch-size * n-samples-per-prompt` |
 | `lr` | 1e-6 | Conservative for RL fine-tuning |
 
 ## Differences from retool
