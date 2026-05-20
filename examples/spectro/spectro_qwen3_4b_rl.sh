@@ -39,12 +39,12 @@ require_path() {
    fi
 }
 
-HF_CHECKPOINT="${HF_CHECKPOINT:-}"
-REF_LOAD="${REF_LOAD:-}"
+HF_CHECKPOINT="${HF_CHECKPOINT:-/workspace/output/qwen3-4b-think-toolcall-0423/v0-20260505-111806/checkpoint-10000}"
+REF_LOAD="${REF_LOAD:-/workspace/output/qwen3-4b-think-toolcall-0423/v0-20260505-111806/checkpoint-10000_torch_dist}"
 SAVE_DIR="${SAVE_DIR:-${SLIME_DIR}/outputs/spectro/qwen3-4b-spectro-rl}"
-SPECTRO_DATA_PATH="${SPECTRO_DATA_PATH:-${SLIME_DIR}/examples/spectro/data/merged.jsonl}"
+SPECTRO_DATA_PATH="${SPECTRO_DATA_PATH:-${SLIME_DIR}/examples/spectro/0423_rl.jsonl}"
 SPECTRO_SKILLS_DIR="${SPECTRO_SKILLS_DIR:-${SLIME_DIR}/examples/spectro/spectra_skills}"
-MEGATRON_PATH="${MEGATRON_PATH:-}"
+MEGATRON_PATH="${MEGATRON_PATH:-/root/Megatron-LM}"
 
 require_path HF_CHECKPOINT "${HF_CHECKPOINT}"
 require_path REF_LOAD "${REF_LOAD}"
@@ -57,8 +57,8 @@ CKPT_ARGS=(
    --hf-checkpoint "${HF_CHECKPOINT}"
    --ref-load "${REF_LOAD}"
    --save "${SAVE_DIR}"
-   --save-interval 20
-   --rotary-base 5000000
+   --save-interval 50
+   --rotary-base 1000000
 )
 
 ROLLOUT_ARGS=(
@@ -67,20 +67,18 @@ ROLLOUT_ARGS=(
    --label-key label
    --rollout-shuffle
    --reward-key score
-   --num-rollout 3000
-   --rollout-batch-size 16
+   --num-rollout 200
+   --rollout-batch-size 24
    --n-samples-per-prompt 8
    --rollout-max-response-len 12288
    --rollout-max-context-len 16384
    --rollout-temperature 1
 
-   --global-batch-size 128
+   --global-batch-size 192
    --balance-data
 )
 
-EVAL_ARGS=(
-   --eval-interval 50
-)
+EVAL_ARGS=()
 
 PERF_ARGS=(
    --tensor-model-parallel-size 2
@@ -138,6 +136,8 @@ MISC_ARGS=(
    --accumulate-allreduce-grads-in-fp32
    --attention-softmax-in-fp32
    --attention-backend flash
+
+   --use-tensorboard
 )
 
 CUSTOM_ARGS=(
@@ -147,14 +147,15 @@ CUSTOM_ARGS=(
 
 # launch ray
 export MASTER_ADDR=${MASTER_ADDR:-"127.0.0.1"}
-ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 4 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
+ray start --head --node-ip-address ${MASTER_ADDR} --num-gpus 8 --disable-usage-stats --dashboard-host=0.0.0.0 --dashboard-port=8265
 
 RUNTIME_ENV_JSON="{
   \"env_vars\": {
     \"PYTHONPATH\": \"${MEGATRON_PATH}:${SCRIPT_DIR}:${SLIME_DIR}:${PYTHONPATH:-}\",
     \"CUDA_DEVICE_MAX_CONNECTIONS\": \"1\",
     \"NCCL_NVLS_ENABLE\": \"${HAS_NVLINK}\",
-    \"SPECTRO_SKILLS_DIR\": \"${SPECTRO_SKILLS_DIR}\"
+    \"SPECTRO_SKILLS_DIR\": \"${SPECTRO_SKILLS_DIR}\",
+    \"TENSORBOARD_DIR\": \"${SAVE_DIR}/tensorboard\"
   }
 }"
 
@@ -162,8 +163,8 @@ ray job submit --address="http://127.0.0.1:8265" \
    --runtime-env-json="${RUNTIME_ENV_JSON}" \
    -- python3 "${SLIME_DIR}/train.py" \
    --actor-num-nodes 1 \
-   --actor-num-gpus-per-node 4 \
-   --colocate \
+   --actor-num-gpus-per-node 6 \
+   --rollout-num-gpus 2 \
    ${MODEL_ARGS[@]} \
    ${CKPT_ARGS[@]} \
    ${ROLLOUT_ARGS[@]} \

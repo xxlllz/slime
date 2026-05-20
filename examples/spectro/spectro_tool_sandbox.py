@@ -14,7 +14,7 @@ TOOL_CONFIGS = {
     "python_timeout": 120,
     "python_memory_limit": "4GB",
     "python_cpu_limit": 1,
-    "max_memory_usage": 12288,
+    "max_memory_usage": 81920,
     "cleanup_threshold": 6144,
     "aggressive_cleanup_threshold": 3072,
     "force_cleanup_threshold": 9216,

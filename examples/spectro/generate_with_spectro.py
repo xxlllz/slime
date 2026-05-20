@@ -98,13 +98,30 @@ def postprocess_responses(resp: str) -> str:
 
 def format_tool_observation(content: str) -> str:
     return (
-        "<|im_end|>\n"
+        "\n"
         "<|im_start|>user\n"
         "<tool_response>\n"
         f"{content}\n"
         "</tool_response><|im_end|>\n"
         "<|im_start|>assistant\n"
     )
+
+
+_TOOL_ERRORS = (
+    "Error: Unknown skill",
+    "Error: SPECTRO_SKILLS_DIR is not set",
+    "Error: Skill file not found",
+    "Error: Memory usage too high",
+    "Error: Process exited with code",
+    "Error: Code execution timed out",
+    "Error: Failed to execute code",
+    "Error: No code provided",
+    "Error: Your previous action was invalid",
+)
+
+
+def has_tool_error(text: str) -> bool:
+    return any(err in text for err in _TOOL_ERRORS)
 
 
 async def execute_predictions(prediction: str) -> tuple[str, bool]:
@@ -189,16 +206,30 @@ async def generate(args, sample, sampling_params):
             cur_response = postprocess_responses(cur_response)
             cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
 
+        action, _ = postprocess_predictions(cur_response)
+        cur_start = len(response_token_ids)
         response += cur_response
         response_token_ids += cur_response_token_ids
-        loss_masks += [1] * len(cur_response_token_ids)
+        # Turn-level credit assignment:
+        #   - final answer turns are trained against the final SMILES reward;
+        #   - correct tool-call turns are not trained by downstream answer errors;
+        #   - invalid/tool-error turns are trained so the policy can repair them.
+        loss_masks += [0] * len(cur_response_token_ids)
 
         if output["meta_info"]["finish_reason"]["type"] == "length":
+            for i in range(cur_start, len(response_token_ids)):
+                loss_masks[i] = 1
             break
 
         next_obs, done = await execute_predictions(cur_response)
         if done:
+            for i in range(cur_start, len(response_token_ids)):
+                loss_masks[i] = 1
             break
+
+        if action not in {"read_skill", "run_code"} or has_tool_error(next_obs):
+            for i in range(cur_start, len(response_token_ids)):
+                loss_masks[i] = 1
 
         if "<tool_response>" in next_obs:
             tool_call_count += 1
@@ -217,6 +248,8 @@ async def generate(args, sample, sampling_params):
             )
 
         if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
+            for i in range(cur_start, len(response_token_ids) - len(obs_tokens_ids)):
+                loss_masks[i] = 1
             break
 
     sample.tokens = prompt_tokens_ids + response_token_ids
@@ -236,6 +269,13 @@ async def generate(args, sample, sampling_params):
     return sample
 
 
+def _get_expected_turns(prompt: str) -> int:
+    """joint_nmr (multi-modal NMR with 13C + 1H + HSQC) expects 4 turns; others expect 2."""
+    if "multi-modal NMR" in prompt and "HSQC" in prompt:
+        return 4
+    return 2
+
+
 async def reward_func(args, sample, **kwargs):
     from slime.utils.types import Sample
 
@@ -243,7 +283,26 @@ async def reward_func(args, sample, **kwargs):
         raise TypeError("Sample must be an instance of Sample class.")
 
     response = sample.response
+
+    # Dump rollout sample for inspection
+    with open("/tmp/rollout_samples.jsonl", "a") as f:
+        import json as _json
+        _json.dump({"prompt": sample.prompt, "response": response, "label": sample.label}, f, ensure_ascii=False)
+        f.write("\n")
+
     num_turns = getattr(sample, "tool_call_count", 0)
+
+    # Penalize failed tool calls.
+    if has_tool_error(response):
+        label = sample.label
+        if isinstance(label, dict):
+            gt = label["ground_truth"][0]
+        elif isinstance(label, str):
+            gt = label
+        else:
+            gt = str(label)
+        smiles_match = re.search(r"<SMILES>(.*?)</SMILES>", response, re.DOTALL)
+        return {"score": -1.0, "pred": (smiles_match.group(1).strip() if smiles_match else ""), "gt": gt}
 
     # Extract ground truth
     label = sample.label
@@ -258,7 +317,7 @@ async def reward_func(args, sample, **kwargs):
     smiles_match = re.search(r"<SMILES>(.*?)</SMILES>", response, re.DOTALL)
     predicted_smiles = smiles_match.group(1).strip() if smiles_match else None
 
-    result = {"score": -1.0, "pred": predicted_smiles or "", "gt": ground_truth_smiles}
+    result = {"score": 0.0, "pred": predicted_smiles or "", "gt": ground_truth_smiles}
 
     if predicted_smiles:
         try:
@@ -286,7 +345,11 @@ async def reward_func(args, sample, **kwargs):
 
     # Reward shaping: encourage tool usage
     if result["score"] < 0:
-        tool_call_reward = (num_turns - 2) / 2 * 0.1
+        tool_call_reward = (num_turns - 1) / 2 * 0.1
         result["score"] = min(-0.6, result["score"] + tool_call_reward)
+
+    # Log for debugging
+    with open("/tmp/spectro_reward_debug.log", "a") as f:
+        f.write(f"score={result['score']:.4f} pred={result.get('pred', '')[:60]:60s} gt={result['gt'][:60]:60s} turns={num_turns}\n")
 
     return result

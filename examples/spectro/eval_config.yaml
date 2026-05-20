@@ -1,0 +1,29 @@
+eval:
+  datasets:
+    c_nmr:
+      name: c_nmr
+      path: /data/zxl/spectra_nmr_toolcall_test500/eval_formatted/spectra_c_nmr_toolcall.jsonl
+      input_key: prompt
+      label_key: label
+      n_samples_per_eval_prompt: 1
+      temperature: 0.1
+      max_response_len: 8192
+      custom_generate_function_path: generate_with_spectro.generate
+    h_nmr:
+      name: h_nmr
+      path: /data/zxl/spectra_nmr_toolcall_test500/eval_formatted/spectra_h_nmr_toolcall.jsonl
+      input_key: prompt
+      label_key: label
+      n_samples_per_eval_prompt: 1
+      temperature: 0.1
+      max_response_len: 8192
+      custom_generate_function_path: generate_with_spectro.generate
+    hsqc:
+      name: hsqc
+      path: /data/zxl/spectra_nmr_toolcall_test500/eval_formatted/spectra_hsqc_nmr_toolcall.jsonl
+      input_key: prompt
+      label_key: label
+      n_samples_per_eval_prompt: 1
+      temperature: 0.1
+      max_response_len: 8192
+      custom_generate_function_path: generate_with_spectro.generate

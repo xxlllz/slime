@@ -52,23 +52,11 @@ def get_args():
     def ceildiv(a, b):
         return -(a // -b)
 
-    if args.pipeline_model_parallel_size == 1 and world_size > 1:
-        pp_size = world_size
-        while True:
-            args.pipeline_model_parallel_size = pp_size
-            args.decoder_last_pipeline_num_layers = args.num_layers - ceildiv(
-                args.num_layers, args.pipeline_model_parallel_size
-            ) * (args.pipeline_model_parallel_size - 1)
-
-            if args.decoder_last_pipeline_num_layers > 0:
-                break
-
-            if pp_size % 2 == 0:
-                pp_size //= 2
-            else:
-                raise ValueError(
-                    f"Cannot find a valid pipeline model parallel size for {args.num_layers} layers and {world_size} GPUs."
-                )
+    # For weight conversion we keep pipeline_model_parallel_size=1 to match
+    # the training config (TP=4, PP=1).  The original auto-PP logic was
+    # written for a different world_size assumption.
+    args.pipeline_model_parallel_size = 1
+    args.decoder_last_pipeline_num_layers = args.num_layers
     print(
         f"Using pipeline model parallel size: {args.pipeline_model_parallel_size}, decoder last pipeline num layers: {args.decoder_last_pipeline_num_layers}"
     )
