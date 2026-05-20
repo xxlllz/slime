@@ -364,7 +364,7 @@ def _get_ground_truth_smiles(sample) -> str:
 
 
 def _score_smiles(predicted_smiles: str | None, ground_truth_smiles: str) -> dict[str, Any]:
-    result = {"score": -1.0, "pred": predicted_smiles or "", "gt": ground_truth_smiles}
+    result = {"score": 0.0, "pred": predicted_smiles or "", "gt": ground_truth_smiles}
     if not predicted_smiles:
         result["error"] = "missing_smiles"
         return result
@@ -416,7 +416,7 @@ def _build_step_rewards(sample, final_score: float) -> tuple[list[float], list[s
         if action == "answer":
             missing_skills = expected_skills - read_expected_skills
             if missing_skills:
-                step_rewards.append(-1.0)
+                step_rewards.append(0.0)
                 reward_reasons.append(f"missing_skills_before_answer:{','.join(sorted(missing_skills))}")
             else:
                 step_rewards.append(float(final_score))
@@ -425,10 +425,10 @@ def _build_step_rewards(sample, final_score: float) -> tuple[list[float], list[s
         elif action == "read_skill":
             skill_name = _normalize_skill_name(content)
             if obs_has_error:
-                step_rewards.append(-1.0)
+                step_rewards.append(0.0)
                 reward_reasons.append("read_skill_tool_error")
             elif expected_skills and skill_name not in expected_skills:
-                step_rewards.append(-1.0)
+                step_rewards.append(0.0)
                 reward_reasons.append(f"wrong_skill:{skill_name}:expected={','.join(sorted(expected_skills))}")
             else:
                 step_rewards.append(1.0)
@@ -437,16 +437,16 @@ def _build_step_rewards(sample, final_score: float) -> tuple[list[float], list[s
                     read_expected_skills.add(skill_name)
         elif action == "run_code":
             if obs_has_error:
-                step_rewards.append(-1.0)
+                step_rewards.append(0.0)
                 reward_reasons.append("run_code_error")
             else:
                 step_rewards.append(1.0)
                 reward_reasons.append("run_code_success")
         elif action in {"invalid", "tool_error", "length", "max_tool_calls"}:
-            step_rewards.append(-1.0)
+            step_rewards.append(0.0)
             reward_reasons.append(action)
         else:
-            step_rewards.append(-1.0)
+            step_rewards.append(0.0)
             reward_reasons.append(f"unknown_action:{action}")
 
     if not answer_indices and step_rewards:
@@ -461,7 +461,7 @@ def _attach_step_rewards(sample, final_score: float) -> None:
     step_spans = metadata.get(_SPECTRO_STEP_SPANS_KEY) or []
     step_rewards, reward_reasons = _build_step_rewards(sample, final_score)
     if len(step_rewards) < len(step_spans):
-        step_rewards += [-1.0] * (len(step_spans) - len(step_rewards))
+        step_rewards += [0.0] * (len(step_spans) - len(step_rewards))
         reward_reasons += ["missing_step_action"] * (len(step_spans) - len(reward_reasons))
     elif len(step_rewards) > len(step_spans):
         step_rewards = step_rewards[: len(step_spans)]
