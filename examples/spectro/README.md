@@ -58,16 +58,35 @@ Skill files are loaded from `SPECTRO_SKILLS_DIR`. Each file must be named `skill
 
 ### Reward Function
 
+The reward has two surfaces:
+
+- `score`: scalar final-answer score used for logging and pass-rate metrics.
+- `spectro_step_rewards`: per-step process rewards used by the custom step-level GRPO advantage path.
+
+Final-answer score:
+
 | Condition | Score |
 |-----------|-------|
-| Exact canonical SMILES match | 1.0 |
-| Valid but non-exact SMILES | Morgan fingerprint Tanimoto similarity to ground truth |
-| Missing SMILES | 0.0 |
-| Tool error response | -1.0 |
+| Valid predicted SMILES | Morgan fingerprint Tanimoto similarity to ground truth |
+| Exact or fingerprint-identical SMILES | 1.0 |
+| Missing or invalid SMILES | -1.0 |
 | Reward-function exception while parsing/scoring | -1.0 |
 
-For negative scores, a small tool-usage bonus can reduce the penalty, capped so the final score stays no higher than
-`-0.6`.
+Process step rewards:
+
+| Step | Score |
+|------|-------|
+| `read_skill` with a correct spectrum skill | 1.0 |
+| `read_skill` with a wrong skill, unknown skill, missing skill file, or other tool error | -1.0 |
+| `run_code` success | 1.0 |
+| `run_code` execution error, timeout, traceback, empty code, or sandbox failure | -1.0 |
+| Invalid action, context length stop, or max tool-call stop | -1.0 |
+| Final answer after all required skills were read | Morgan fingerprint Tanimoto similarity |
+| Final answer before all required skills were read | -1.0 |
+
+The expected skill set is inferred from the prompt. Single-spectrum examples expect one skill, such as `h_nmr`,
+`c_nmr`, `hsqc`, `ir`, `raman`, `uv`, or `msms`. Multi-spectrum inputs expect all matching skills; for example, a
+joint NMR prompt containing 13C NMR, 1H NMR, and HSQC expects `c_nmr`, `h_nmr`, and `hsqc` before the final answer.
 
 ### Step-Level GRPO Credit Assignment
 
@@ -87,8 +106,8 @@ assistant step 3: final answer
 Only assistant tokens receive policy-gradient loss. Tool observation tokens remain in the model context but have
 `loss_mask = 0`.
 
-For the current SMILES reward, the scalar score is attached to the final answer step when present. If there is no
-answer step, it is attached to the last assistant step. Step returns are then computed as reward-to-go:
+Each assistant step gets its own process reward. Tool observation tokens are kept in the context with `loss_mask = 0`.
+Step returns are then computed as reward-to-go:
 
 ```text
 G_t = r_t + gamma * G_{t+1}

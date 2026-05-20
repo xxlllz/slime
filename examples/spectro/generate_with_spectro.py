@@ -123,11 +123,69 @@ _TOOL_ERRORS = (
 _PRECOMPUTED_ADVANTAGE_KEY = "precomputed_advantages"
 _SPECTRO_STEP_SPANS_KEY = "spectro_step_token_spans"
 _SPECTRO_STEP_ACTIONS_KEY = "spectro_step_actions"
+_SPECTRO_STEP_CONTENTS_KEY = "spectro_step_contents"
+_SPECTRO_STEP_OBS_ERRORS_KEY = "spectro_step_obs_errors"
 _SPECTRO_STEP_REWARDS_KEY = "spectro_step_rewards"
+_SPECTRO_STEP_REWARD_REASONS_KEY = "spectro_step_reward_reasons"
+
+_SKILL_ALIASES = {
+    "h": "h_nmr",
+    "1h": "h_nmr",
+    "1h_nmr": "h_nmr",
+    "proton": "h_nmr",
+    "proton_nmr": "h_nmr",
+    "c": "c_nmr",
+    "13c": "c_nmr",
+    "13c_nmr": "c_nmr",
+    "carbon": "c_nmr",
+    "carbon_nmr": "c_nmr",
+    "carbon13": "c_nmr",
+    "carbon_13": "c_nmr",
+    "mass_spec": "msms",
+    "mass_spectrometry": "msms",
+    "ms": "msms",
+    "ms_ms": "msms",
+    "uv_vis": "uv",
+    "uvvis": "uv",
+}
 
 
 def has_tool_error(text: str) -> bool:
-    return any(err in text for err in _TOOL_ERRORS)
+    return (
+        any(err in text for err in _TOOL_ERRORS)
+        or "Traceback:" in text
+        or bool(re.search(r"<tool_response>\s*Error:", text))
+    )
+
+
+def _normalize_skill_name(name: str) -> str:
+    normalized = str(name or "").strip().lower().replace("-", "_").replace(" ", "_")
+    normalized = re.sub(r"_+", "_", normalized)
+    return _SKILL_ALIASES.get(normalized, normalized)
+
+
+def _expected_skill_names(prompt: str) -> set[str]:
+    text = str(prompt or "").lower()
+    expected = set()
+
+    if re.search(r"\b1h\s*nmr\b|proton nuclear magnetic resonance|proton\s+nmr|h-shifts", text):
+        expected.add("h_nmr")
+    if re.search(r"\b13c\s*nmr\b|carbon-13 nuclear magnetic resonance|carbon\s*13|c-shifts", text):
+        expected.add("c_nmr")
+    if "hsqc" in text or "heteronuclear single quantum coherence" in text:
+        expected.add("hsqc")
+    if re.search(r"\bir spectrum\b|infrared|ir spectroscopy", text):
+        expected.add("ir")
+    if "raman" in text:
+        expected.add("raman")
+    if "uv-vis" in text or "uv/vis" in text or re.search(r"\buv\s+spectrum\b|uv spectroscopy", text):
+        expected.add("uv")
+    if "ms/ms" in text or "fragmentation" in text or "mass spectrometry" in text or "massspec" in text:
+        expected.add("msms")
+    if "simnmr" in text or "simulated nmr" in text:
+        expected.add("simnmr")
+
+    return expected
 
 
 async def execute_predictions(prediction: str) -> tuple[str, bool]:
@@ -178,6 +236,8 @@ async def generate(args, sample, sampling_params):
     tool_call_count = 0
     step_spans = []
     step_actions = []
+    step_contents = []
+    step_obs_errors = []
     finish_reason_type = "stop"
 
     for turn in range(TOOL_CONFIGS["max_turns"]):
@@ -217,7 +277,7 @@ async def generate(args, sample, sampling_params):
             cur_response = postprocess_responses(cur_response)
             cur_response_token_ids = state.tokenizer(cur_response, add_special_tokens=False)["input_ids"]
 
-        action, _ = postprocess_predictions(cur_response)
+        action, action_content = postprocess_predictions(cur_response)
         cur_start = len(response_token_ids)
         response += cur_response
         response_token_ids += cur_response_token_ids
@@ -228,20 +288,23 @@ async def generate(args, sample, sampling_params):
             if cur_end > cur_start:
                 step_spans.append((cur_start, cur_end))
                 step_actions.append("length")
+                step_contents.append(action_content)
+                step_obs_errors.append(True)
             break
 
         next_obs, done = await execute_predictions(cur_response)
+        obs_has_error = (not done) and has_tool_error(next_obs)
         if cur_end > cur_start:
             if done:
                 step_action = "answer"
             elif action not in {"read_skill", "run_code"}:
                 step_action = "invalid"
-            elif has_tool_error(next_obs):
-                step_action = "tool_error"
             else:
                 step_action = action
             step_spans.append((cur_start, cur_end))
             step_actions.append(step_action)
+            step_contents.append(action_content)
+            step_obs_errors.append(obs_has_error)
 
         if done:
             break
@@ -265,6 +328,7 @@ async def generate(args, sample, sampling_params):
         if tool_call_count >= TOOL_CONFIGS["max_tool_calls"]:
             if step_actions:
                 step_actions[-1] = "max_tool_calls"
+                step_obs_errors[-1] = True
             break
 
     sample.tokens = prompt_tokens_ids + response_token_ids
@@ -275,6 +339,8 @@ async def generate(args, sample, sampling_params):
     sample.train_metadata = {
         _SPECTRO_STEP_SPANS_KEY: step_spans,
         _SPECTRO_STEP_ACTIONS_KEY: step_actions,
+        _SPECTRO_STEP_CONTENTS_KEY: step_contents,
+        _SPECTRO_STEP_OBS_ERRORS_KEY: step_obs_errors,
     }
 
     match finish_reason_type:
@@ -288,18 +354,121 @@ async def generate(args, sample, sampling_params):
     return sample
 
 
+def _get_ground_truth_smiles(sample) -> str:
+    label = sample.label
+    if isinstance(label, dict):
+        return label["ground_truth"][0]
+    if isinstance(label, str):
+        return label
+    return str(label)
+
+
+def _score_smiles(predicted_smiles: str | None, ground_truth_smiles: str) -> dict[str, Any]:
+    result = {"score": -1.0, "pred": predicted_smiles or "", "gt": ground_truth_smiles}
+    if not predicted_smiles:
+        result["error"] = "missing_smiles"
+        return result
+
+    try:
+        from rdkit import Chem
+        from rdkit.Chem import AllChem
+        from rdkit.DataStructs import TanimotoSimilarity
+
+        pred_mol = Chem.MolFromSmiles(predicted_smiles)
+        gt_mol = Chem.MolFromSmiles(ground_truth_smiles)
+        if pred_mol is None or gt_mol is None:
+            result["error"] = "invalid_smiles"
+            return result
+
+        pred_canonical = Chem.MolToSmiles(pred_mol)
+        gt_canonical = Chem.MolToSmiles(gt_mol)
+        pred_fp = AllChem.GetMorganFingerprintAsBitVect(pred_mol, 2, nBits=2048)
+        gt_fp = AllChem.GetMorganFingerprintAsBitVect(gt_mol, 2, nBits=2048)
+        tanimoto = float(TanimotoSimilarity(pred_fp, gt_fp))
+
+        result["score"] = tanimoto
+        result["tanimoto"] = tanimoto
+        result["exact_match"] = pred_canonical == gt_canonical
+        result["pred_canonical"] = pred_canonical
+        result["gt_canonical"] = gt_canonical
+        return result
+    except Exception as exc:
+        result["error"] = f"scoring_exception: {exc}"
+        return result
+
+
+def _build_step_rewards(sample, final_score: float) -> tuple[list[float], list[str]]:
+    metadata = sample.train_metadata or {}
+    step_actions = metadata.get(_SPECTRO_STEP_ACTIONS_KEY) or []
+    step_contents = metadata.get(_SPECTRO_STEP_CONTENTS_KEY) or [""] * len(step_actions)
+    step_obs_errors = metadata.get(_SPECTRO_STEP_OBS_ERRORS_KEY) or [False] * len(step_actions)
+    expected_skills = _expected_skill_names(sample.prompt)
+
+    step_rewards = []
+    reward_reasons = []
+    answer_indices = []
+    read_expected_skills = set()
+
+    for idx, action in enumerate(step_actions):
+        content = step_contents[idx] if idx < len(step_contents) else ""
+        obs_has_error = bool(step_obs_errors[idx]) if idx < len(step_obs_errors) else False
+
+        if action == "answer":
+            missing_skills = expected_skills - read_expected_skills
+            if missing_skills:
+                step_rewards.append(-1.0)
+                reward_reasons.append(f"missing_skills_before_answer:{','.join(sorted(missing_skills))}")
+            else:
+                step_rewards.append(float(final_score))
+                reward_reasons.append("answer_fingerprint_similarity")
+            answer_indices.append(idx)
+        elif action == "read_skill":
+            skill_name = _normalize_skill_name(content)
+            if obs_has_error:
+                step_rewards.append(-1.0)
+                reward_reasons.append("read_skill_tool_error")
+            elif expected_skills and skill_name not in expected_skills:
+                step_rewards.append(-1.0)
+                reward_reasons.append(f"wrong_skill:{skill_name}:expected={','.join(sorted(expected_skills))}")
+            else:
+                step_rewards.append(1.0)
+                reward_reasons.append(f"correct_skill:{skill_name}")
+                if skill_name in expected_skills:
+                    read_expected_skills.add(skill_name)
+        elif action == "run_code":
+            if obs_has_error:
+                step_rewards.append(-1.0)
+                reward_reasons.append("run_code_error")
+            else:
+                step_rewards.append(1.0)
+                reward_reasons.append("run_code_success")
+        elif action in {"invalid", "tool_error", "length", "max_tool_calls"}:
+            step_rewards.append(-1.0)
+            reward_reasons.append(action)
+        else:
+            step_rewards.append(-1.0)
+            reward_reasons.append(f"unknown_action:{action}")
+
+    if not answer_indices and step_rewards:
+        step_rewards[-1] = min(step_rewards[-1], float(final_score))
+        reward_reasons[-1] = f"{reward_reasons[-1]}|missing_answer"
+
+    return step_rewards, reward_reasons
+
+
 def _attach_step_rewards(sample, final_score: float) -> None:
     metadata = dict(sample.train_metadata or {})
     step_spans = metadata.get(_SPECTRO_STEP_SPANS_KEY) or []
-    step_actions = metadata.get(_SPECTRO_STEP_ACTIONS_KEY) or []
-    step_rewards = [0.0] * len(step_spans)
-
-    if step_rewards:
-        answer_indices = [i for i, action in enumerate(step_actions) if action == "answer"]
-        reward_index = answer_indices[-1] if answer_indices else len(step_rewards) - 1
-        step_rewards[reward_index] = float(final_score)
+    step_rewards, reward_reasons = _build_step_rewards(sample, final_score)
+    if len(step_rewards) < len(step_spans):
+        step_rewards += [-1.0] * (len(step_spans) - len(step_rewards))
+        reward_reasons += ["missing_step_action"] * (len(step_spans) - len(reward_reasons))
+    elif len(step_rewards) > len(step_spans):
+        step_rewards = step_rewards[: len(step_spans)]
+        reward_reasons = reward_reasons[: len(step_spans)]
 
     metadata[_SPECTRO_STEP_REWARDS_KEY] = step_rewards
+    metadata[_SPECTRO_STEP_REWARD_REASONS_KEY] = reward_reasons
     metadata["spectro_final_score"] = float(final_score)
     sample.train_metadata = metadata
 
@@ -483,68 +652,22 @@ async def reward_func(args, sample, **kwargs):
         f.write("\n")
 
     num_turns = getattr(sample, "tool_call_count", 0)
-
-    # Penalize failed tool calls.
-    if has_tool_error(response):
-        label = sample.label
-        if isinstance(label, dict):
-            gt = label["ground_truth"][0]
-        elif isinstance(label, str):
-            gt = label
-        else:
-            gt = str(label)
-        smiles_match = re.search(r"<SMILES>(.*?)</SMILES>", response, re.DOTALL)
-        _attach_step_rewards(sample, -1.0)
-        return {"score": -1.0, "pred": (smiles_match.group(1).strip() if smiles_match else ""), "gt": gt}
-
-    # Extract ground truth
-    label = sample.label
-    if isinstance(label, dict):
-        ground_truth_smiles = label["ground_truth"][0]
-    elif isinstance(label, str):
-        ground_truth_smiles = label
-    else:
-        ground_truth_smiles = str(label)
+    ground_truth_smiles = _get_ground_truth_smiles(sample)
 
     # Extract predicted SMILES
     smiles_match = re.search(r"<SMILES>(.*?)</SMILES>", response, re.DOTALL)
     predicted_smiles = smiles_match.group(1).strip() if smiles_match else None
 
-    result = {"score": 0.0, "pred": predicted_smiles or "", "gt": ground_truth_smiles}
-
-    if predicted_smiles:
-        try:
-            from rdkit import Chem
-            from rdkit.Chem import AllChem
-            from rdkit.DataStructs import TanimotoSimilarity
-
-            pred_mol = Chem.MolFromSmiles(predicted_smiles)
-            gt_mol = Chem.MolFromSmiles(ground_truth_smiles)
-
-            if pred_mol is not None and gt_mol is not None:
-                pred_canonical = Chem.MolToSmiles(pred_mol)
-                gt_canonical = Chem.MolToSmiles(gt_mol)
-
-                if pred_canonical == gt_canonical:
-                    result["score"] = 1.0
-                else:
-                    pred_fp = AllChem.GetMorganFingerprintAsBitVect(pred_mol, 2, nBits=2048)
-                    gt_fp = AllChem.GetMorganFingerprintAsBitVect(gt_mol, 2, nBits=2048)
-                    tanimoto = TanimotoSimilarity(pred_fp, gt_fp)
-                    result["tanimoto"] = tanimoto
-                    result["score"] = tanimoto
-        except Exception:
-            result["score"] = -1.0
-
-    # Reward shaping: encourage tool usage
-    if result["score"] < 0:
-        tool_call_reward = (num_turns - 1) / 2 * 0.1
-        result["score"] = min(-0.6, result["score"] + tool_call_reward)
-
+    result = _score_smiles(predicted_smiles, ground_truth_smiles)
+    result["has_tool_error"] = has_tool_error(response)
     _attach_step_rewards(sample, float(result["score"]))
 
     # Log for debugging
     with open("/tmp/spectro_reward_debug.log", "a") as f:
-        f.write(f"score={result['score']:.4f} pred={result.get('pred', '')[:60]:60s} gt={result['gt'][:60]:60s} turns={num_turns}\n")
+        step_rewards = (sample.train_metadata or {}).get(_SPECTRO_STEP_REWARDS_KEY, [])
+        f.write(
+            f"score={result['score']:.4f} pred={result.get('pred', '')[:60]:60s} "
+            f"gt={result['gt'][:60]:60s} turns={num_turns} step_rewards={step_rewards}\n"
+        )
 
     return result
