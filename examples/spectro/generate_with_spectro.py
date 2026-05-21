@@ -3,54 +3,69 @@ import os
 import re
 from typing import Any
 
-try:
-    from jinja2 import Template
-except ImportError as e:
-    raise ImportError("Jinja2 is required. Please install it with: pip install jinja2") from e
-
 from spectro_tool_sandbox import SEMAPHORE, TOOL_CONFIGS, tool_registry
 
-# Qwen3 tool-calling template (same as retool)
-TOOL_TEMPLATE = """<|im_start|>system
-{%- if messages[0]['role'] == 'system' %}
-{{ messages[0]['content'] }}
-{%- else %}
-You are a helpful assistant.
-{%- endif %}
-{%- if tools %}
+
+def _wrap_tool_for_ms_swift(tool: dict[str, Any]) -> dict[str, Any]:
+    """Mirror ms-swift BaseAgentTemplate.wrap_tool."""
+    if "type" in tool and "function" in tool:
+        return tool
+    return {"type": "function", "function": tool}
+
+
+def _format_tools_ms_swift_hermes(tools: list[dict[str, Any]], system: str | None = None) -> str:
+    """Mirror ms-swift HermesAgentTemplate._format_tools."""
+    tool_descs = [json.dumps(_wrap_tool_for_ms_swift(tool), ensure_ascii=False) for tool in tools]
+    system = system or ""
+    return f"""{system}
+
 # Tools
 
 You may call one or more functions to assist with the user query.
 
 You are provided with function signatures within <tools></tools> XML tags:
 <tools>
-{% for tool in tools %}
-{{ tool | tojson }}
-{% endfor %}
+""" + "\n".join(tool_descs) + """
 </tools>
 
 For each function call, return a json object with function name and arguments within <tool_call></tool_call> XML tags:
 <tool_call>
 {"name": <function-name>, "arguments": <args-json-object>}
-</tool_call>
-{%- endif %}
-<|im_end|>
-{%- for message in messages %}
-{%- if message['role'] == 'user' %}
-<|im_start|>user
-{{ message['content'] }}<|im_end|>
-{%- elif message['role'] == 'assistant' %}
-<|im_start|>assistant
-{{ message['content'] }}<|im_end|>
-{%- endif %}
-{%- endfor %}
-<|im_start|>assistant
-"""
+</tool_call>"""
+
+
+def _render_chatml_ms_swift_hermes(messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> str:
+    """Render the same ChatML text as ms-swift qwen3 + hermes for rollout prompts."""
+    system = None
+    if messages and messages[0]["role"] == "system":
+        system = messages[0]["content"]
+        messages = messages[1:]
+
+    if tools:
+        system = _format_tools_ms_swift_hermes(tools, system)
+
+    rendered = ""
+    if system is not None:
+        rendered += f"<|im_start|>system\n{system}<|im_end|>\n"
+
+    for message in messages:
+        role = message["role"]
+        content = message["content"]
+        if role == "user":
+            rendered += f"<|im_start|>user\n{content}<|im_end|>\n<|im_start|>assistant\n"
+        elif role == "assistant":
+            rendered += f"{content}<|im_end|>\n"
+        else:
+            raise ValueError(f"Unsupported role for rollout prompt rendering: {role}")
+
+    if not rendered.endswith("<|im_start|>assistant\n"):
+        rendered += "<|im_start|>assistant\n"
+    return rendered
+
 
 def format_conversation_with_tools(
     prompt: str, tools: list[dict[str, Any]] = None, system_prompt: str = None, messages: list[dict[str, Any]] = None
 ) -> str:
-    template = Template(TOOL_TEMPLATE)
     messages_to_render = []
     if system_prompt:
         messages_to_render.append({"role": "system", "content": system_prompt})
@@ -58,7 +73,7 @@ def format_conversation_with_tools(
         messages_to_render.append({"role": "user", "content": prompt})
     if messages:
         messages_to_render.extend(messages)
-    return template.render(messages=messages_to_render, tools=tools or [])
+    return _render_chatml_ms_swift_hermes(messages_to_render, tools or [])
 
 
 def postprocess_predictions(prediction: str):
@@ -97,9 +112,12 @@ def postprocess_responses(resp: str) -> str:
     return resp
 
 
-def format_tool_observation(content: str) -> str:
-    return (
-        "\n"
+def format_tool_observation(content: str, assistant_response: str = "") -> str:
+    if assistant_response.rstrip().endswith("<|im_end|>"):
+        prefix = "\n"
+    else:
+        prefix = "<|im_end|>\n"
+    return prefix + (
         "<|im_start|>user\n"
         "<tool_response>\n"
         f"{content}\n"
@@ -193,16 +211,16 @@ async def execute_predictions(prediction: str) -> tuple[str, bool]:
 
     if action == "read_skill":
         result = await tool_registry.execute_tool("read_skill", {"name": content.strip()})
-        return format_tool_observation(result), False
+        return format_tool_observation(result, prediction), False
 
     elif action == "run_code":
         code = content.strip()
         if code:
             async with SEMAPHORE:
                 result = await tool_registry.execute_tool("run_code", {"code": code})
-            return format_tool_observation(result), False
+            return format_tool_observation(result, prediction), False
         else:
-            return format_tool_observation("Error: No code provided"), False
+            return format_tool_observation("Error: No code provided", prediction), False
 
     elif action == "answer":
         return "", True
@@ -212,7 +230,8 @@ async def execute_predictions(prediction: str) -> tuple[str, bool]:
             "Error: Your previous action was invalid. "
             "Use read_skill to load domain knowledge, "
             "run_code to execute Python analysis code, "
-            "or provide your final answer in <SMILES>...</SMILES> tags.\n"
+            "or provide your final answer in <SMILES>...</SMILES> tags.\n",
+            prediction,
         ), False
 
 

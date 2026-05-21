@@ -7,9 +7,7 @@ from generate_with_spectro import (
     format_conversation_with_tools,
     postprocess_predictions,
     postprocess_responses,
-    format_tool_observation,
     execute_predictions,
-    TOOL_TEMPLATE,
 )
 from spectro_tool_sandbox import TOOL_CONFIGS, tool_registry
 from slime.utils.http_utils import post
